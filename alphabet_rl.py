@@ -33,6 +33,9 @@ def load_q():
         with open(Q_PATH, "r") as f:
             raw = json.load(f)
             Q = defaultdict(dict, raw)
+def is_mastered(ltr, mastery_map):
+    return mastery_map.get(ltr, 0) >= 2
+
 
 def save_q():
     with open(Q_PATH, "w") as f:
@@ -41,17 +44,43 @@ def save_q():
 def state_key(letter: str, mastery_level: int) -> str:
     return f"{letter}:{mastery_level}"
 
+
+def heuristic_policy(letter, ml, mastery_map, recent):
+    # If mastered, definitely move on
+    if ml >= 2:
+        return "move_next"
+    # Prefer moving on once practicing starts
+    if ml >= PREFER_MOVE_ON_AT_ML:
+        return "move_next"
+    # If there are true trouble letters, jump to one
+    t = pick_trouble_letter(mastery_map, letter) if mastery_map else None
+    if t and t != letter:
+        return "jump_trouble"
+    # If there’s enough recent material (non-mastered), review it
+    if recent:
+        recent_unmastered = [r for r in set(recent) if not is_mastered(r, mastery_map)]
+        if len(recent_unmastered) >= MIN_RECENT_FOR_REVIEW:
+            return "review_recent"
+    # Otherwise, practice current
+    return "practice_current"
+
+
 def argmax_action(skey: str):
+    # If we have nothing learned for this state yet, defer to heuristic instead of random
     if skey not in Q or not Q[skey]:
-        return random.choice(ACTIONS)
+        return None  # signal "no learned action"
     return max(Q[skey].items(), key=lambda kv: kv[1])[0]
 
+def epsilon_greedy(skey: str, letter, ml, mastery_map, recent):
+    learned_best = argmax_action(skey)
+    if learned_best is None:
+        # Cold-start: use heuristic, not random
+        base = heuristic_policy(letter, ml, mastery_map, recent)
+        # Still allow a *bit* of exploration if you want:
+        return random.choice(ACTIONS) if random.random() < EPSILON else base
+    # We have learned values; do normal epsilon-greedy
+    return random.choice(ACTIONS) if random.random() < EPSILON else learned_best
 
-
-def epsilon_greedy(skey: str):
-    if random.random() < EPSILON:
-        return random.choice(ACTIONS)
-    return argmax_action(skey)
 
 def update_q(skey: str, action: str, reward: float, next_skey: str):
     old_q = Q[skey].get(action, 0.0)
@@ -60,16 +89,29 @@ def update_q(skey: str, action: str, reward: float, next_skey: str):
     Q[skey][action] = new_q
     save_q()
 
-def next_letter(letter: str):
+def next_letter(letter: str, mastery_map=None):
     idx = LETTERS.index(letter)
-    return LETTERS[min(idx + 1, len(LETTERS) - 1)]
+    # Try to find the next letter that is not mastered
+    if mastery_map:
+        n = len(LETTERS)
+        for step in range(1, n+1):
+            cand = LETTERS[(idx + step) % n]
+            if mastery_map.get(cand, 0) < 2:
+                return cand
+    # Fallback: wrap
+    return LETTERS[(idx + 1) % len(LETTERS)]
 
-def pick_trouble_letter(mastery_map):
-    # mastery_map: {"A":0..2, ...}; choose lowest mastery with most errors
-    trouble = [l for l, m in mastery_map.items() if m == 0]
-    if not trouble:
-        trouble = [l for l, m in mastery_map.items() if m == 1]
-    return random.choice(trouble) if trouble else None
+
+def pick_trouble_letter(mastery_map, current_letter):
+    # prefer mastery 0, then 1
+    candidates = [l for l, m in mastery_map.items() if m == 0] or \
+                 [l for l, m in mastery_map.items() if m == 1]
+    if not candidates:
+        return None
+    # choose the nearest in alphabet distance to current
+    cidx = LETTERS.index(current_letter)
+    return min(candidates, key=lambda l: abs(LETTERS.index(l) - cidx))
+
 
 @app.route("/alphabet/next", methods=["POST"])
 def api_next():
@@ -88,9 +130,14 @@ def api_next():
     ml = int(data.get("mastery_level", 0))
     mastery_map = data.get("mastery_map", {})
     recent = data.get("recent_history", [])
+    # 🚫 Skip mastered letters
+    if mastery_map.get(letter, 0) >= 2:
+        letter = next_letter(letter, mastery_map)
+        ml = mastery_map.get(letter, 0)
 
     skey = state_key(letter, ml)
-    action = epsilon_greedy(skey)
+    action = epsilon_greedy(skey, letter, ml, mastery_map, recent)
+
 
     # Compute a concrete recommendation payload
     target = {"letter": letter, "list": []}
@@ -99,23 +146,34 @@ def api_next():
         target["letter"] = letter
 
     elif action == "move_next":
-        target["letter"] = next_letter(letter)
+        target["letter"] = next_letter(letter, mastery_map)
 
     elif action == "jump_trouble":
-        t = pick_trouble_letter(mastery_map) if mastery_map else None
+        t = pick_trouble_letter(mastery_map, letter) if mastery_map else None
         target["letter"] = t or letter
 
+
     elif action == "review_recent":
-        # last up to 3 distinct recent letters, fallback to current
+        # last up to 3 distinct *unmastered* recent letters (most-recent first)
         seen = []
         for l in reversed(recent):
-            if l not in seen:
+            if l not in seen and not is_mastered(l, mastery_map):
                 seen.append(l)
             if len(seen) == 3:
                 break
-        target["list"] = seen or [letter]
-        target["letter"] = (seen[-1] if seen else letter)
+        if not seen:
+            # nothing to review—move on
+            action = "move_next"
+            target["letter"] = next_letter(letter, mastery_map)
+            target["list"] = []
+        else:
+            target["list"] = seen
+            target["letter"] = seen[0]  # most recent unique, unmastered
 
+    if is_mastered(target["letter"], mastery_map):
+        target["letter"] = next_letter(letter, mastery_map)
+    if target.get("list"):
+        target["list"] = [l for l in target["list"] if not is_mastered(l, mastery_map)]
     return jsonify({"action": action, "target": target, "state_key": skey})
 
 @app.route("/alphabet/feedback", methods=["POST"])
